@@ -157,12 +157,20 @@ def save_measurement(measurement):
 
     return csv_path
 
+# ============================================================
+# espera
+# ============================================================
+def wait_or_stop(seconds):
+    """Espera el tiempo indicado, permitiendo detener el programa."""
+    deadline = time.monotonic() + seconds
 
-# ============================================================
-# CICLO PRINCIPAL
-# ============================================================
+    while running and time.monotonic() < deadline:
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
 
 def main():
+    global running
+
     configure_logging()
 
     signal.signal(signal.SIGTERM, stop_handler)
@@ -171,68 +179,102 @@ def main():
     logging.info("Iniciando adquisición meteorológica")
     logging.info("Puerto serial: %s", SERIAL_PORT)
     logging.info("Periodo de lectura: %s segundos", REQUEST_PERIOD)
+    logging.info("Intervalo de reconexión: %s segundos", RECONNECT_DELAY)
+
+    # None: todavía no conocemos el estado.
+    # False: estación sin comunicación.
+    # True: estación respondiendo correctamente.
+    station_available = None
 
     while running:
         client = create_client()
+        connected = False
 
         try:
-            logging.info("Intentando conectar con la estación...")
+            connected = client.connect()
 
-            if not client.connect():
-                logging.warning(
-                    "No se pudo abrir la conexión serial."
-                )
-                continue
-
-            logging.info("Conexión serial establecida")
-
-            while running:
-                cycle_start = time.monotonic()
-
-                try:
-                    measurement = read_measurements(client)
-                    csv_path = save_measurement(measurement)
-
-                    logging.info(
-                        "Medición guardada en %s",
-                        csv_path.name,
+            if not connected:
+                if station_available is not False:
+                    logging.warning(
+                        "Estación desconectada o puerto serial no disponible. "
+                        "Se reintentará en %s segundos.",
+                        RECONNECT_DELAY,
                     )
 
-                except Exception:
-                    logging.exception(
-                        "Falló la lectura o el almacenamiento; "
-                        "se intentará reconectar."
-                    )
-                    break
+                station_available = False
+                continue_wait = True
 
-                elapsed = time.monotonic() - cycle_start
-                remaining = max(0, REQUEST_PERIOD - elapsed)
+            else:
+                logging.info("Puerto serial abierto; verificando comunicación.")
 
-                # Permite detener el programa durante la espera.
-                deadline = time.monotonic() + remaining
-                while running and time.monotonic() < deadline:
-                    time.sleep(min(0.2, deadline - time.monotonic()))
+                while running:
+                    cycle_start = time.monotonic()
+
+                    # Primero intentamos leer la estación.
+                    try:
+                        measurement = read_measurements(client)
+
+                    except Exception as exc:
+                        if station_available is not False:
+                            logging.warning(
+                                "Comunicación con la estación perdida: %s. "
+                                "Se intentará reconectar.",
+                                exc,
+                            )
+
+                        station_available = False
+                        break
+
+                    # Una lectura válida confirma la comunicación.
+                    if station_available is not True:
+                        logging.info(
+                            "COMUNICACIÓN RECUPERADA: "
+                            "lectura Modbus válida."
+                        )
+
+                    station_available = True
+
+                    # El almacenamiento tiene su propio manejo de errores.
+                    try:
+                        csv_path = save_measurement(measurement)
+
+                        logging.info(
+                            "Medición guardada: %s",
+                            csv_path.name,
+                        )
+
+                    except Exception:
+                        logging.exception(
+                            "Error al guardar la medición en CSV."
+                        )
+
+                    elapsed = time.monotonic() - cycle_start
+                    wait_or_stop(max(0, REQUEST_PERIOD - elapsed))
 
         except Exception:
-            logging.exception("Error en el ciclo de adquisición")
+            if station_available is not False:
+                logging.exception(
+                    "Error durante la comunicación con la estación."
+                )
+
+            station_available = False
 
         finally:
             try:
                 client.close()
             except Exception:
-                logging.exception("Error al cerrar el cliente Modbus")
+                logging.exception("Error al cerrar el cliente Modbus.")
 
         if running:
-            logging.info(
-                "Reintentando conexión en %s segundos",
-                RECONNECT_DELAY,
-            )
+            if not connected:
+                # Evita repetir el mensaje de desconexión en cada intento.
+                wait_or_stop(RECONNECT_DELAY)
+            else:
+                # Espera antes de crear un cliente nuevo tras un fallo
+                # de lectura o comunicación.
+                wait_or_stop(RECONNECT_DELAY)
 
-            deadline = time.monotonic() + RECONNECT_DELAY
-            while running and time.monotonic() < deadline:
-                time.sleep(min(0.2, deadline - time.monotonic()))
-
-    logging.info("Adquisición detenida correctamente")
+    logging.info("Adquisición meteorológica detenida correctamente.")
 
 
 if __name__ == "__main__":
